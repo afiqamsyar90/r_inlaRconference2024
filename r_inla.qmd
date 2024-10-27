@@ -1,0 +1,394 @@
+---
+title: "Geostatistical Modelling using R-INLA"
+author: "Afiq Amsyar"
+format:
+  html:
+    toc: true
+    toc-location: left
+    theme: 
+      light: cosmo
+      dark: 
+        - cosmo
+        - theme-dark.scss
+    grid:
+      sidebar-width: 300px
+      margin-width: 300px
+      body-width: 900px
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+  docx: 
+    toc: true
+    toc-depth: 2
+self-contained: true
+---
+
+# R-INLA
+
+INLA is implemented as an R package called `INLA`, although this package is also called `R-INLA`. The package is not available from the main R repository CRAN, but from a specific repository at [http://www.r-inla.org](http://www.r-inla.org/). The `INLA` package is available for Windows, Mac OS X and Linux, and there are a stable and a testing version.
+
+A simple way to install the stable version is shown below. For the testing version, simply replace `stable` by `testing` when setting the repository.
+
+```{r, eval = FALSE}
+options(timeout = 600)  # Increase timeout to 600 seconds
+install.packages("INLA", repos=c(getOption("repos"), INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+```
+
+The main function in the package is `inla()`, which is the one used to fit the Bayesian models using the INLA methodology. This function works in a similar way as function `glm()` (for generalized linear models) or `gam()` (for generalized additive models). A formula is used to specify the model to be fitted and it can include a mix of fixed and other effects conveniently specified.
+
+Specific (random) effects are specified using the `f()` function. This includes an index to map the effect to the observations, the type of effect, additional parameters and the priors on the hyperparameters of the effect. When including a random effect in the model, not all of these options need to be specified.
+
+## 1 Load Packages
+
+```{r}
+library(pacman) 
+p_load(sf, rgeos, rgdal, dplyr, tmap, leaflet, tidyverse, raster,lwgeom, corrplot,viridis,mice)
+```
+
+```{r}
+library(INLA)
+library(readxl)
+```
+
+## 2 Import Polygon
+
+```{r}
+# with mukim 
+Kel <- st_read("kelantan.shp")
+plot(Kel)
+```
+
+### 2.1 Insert projected coordinates reference system
+
+```{r}
+st_crs(Kel) <- 3168 
+head(Kel)
+```
+
+### 2.2 Obtain centroid of polygon
+
+```{r}
+# obtain centroid of polygon 
+centroid <- Kel %>% mutate(lon = map_dbl(geometry, ~st_centroid(.x)[[1]]), 
+                           lat = map_dbl(geometry, ~st_centroid(.x)[[2]]))
+# Select only woking variable 
+centroid <- centroid[,c(3,6,8,9)]
+```
+
+## 3 Leptospirosis Data
+
+### 3.1 Import Case Data
+
+```{r}
+dat <- read_excel ("lepto.xlsx")
+names(dat)
+```
+
+```{r}
+# convert raw data into aggregated data by sub-district 
+aggregate1 <- group_by(dat, MUKIM) %>% 
+  summarize( cases = n() ) 
+head(aggregate1)
+```
+
+### 3.2 Merging data between main data and centroid
+
+```{r}
+# merge the data 
+main.dat <- merge(aggregate1, centroid, by.x = "MUKIM",by.y = "MUKIM") 
+names(main.dat)
+# remove geometry 
+main.dat <- main.dat[,-c(6)]
+
+# create spatial point using kertau 
+dat.kertau <- SpatialPoints(main.dat[, c("lon", "lat")], proj4string = CRS("+proj=omerc +no_uoff +lat_0=4 +lonc=102.25 +alpha=323.0257905 +gamma=323.130102361111 +k=0.99984 +x_0=804670.24 +y_0=0 +ellps=evrst69 +units=m +no_defs"))
+
+# convert CRS to WGS84 
+dat.WGS84 <- spTransform(dat.kertau, CRS("+proj=longlat +datum=WGS84")) 
+
+# add longlat variable into main data frame 
+main.dat[, c("lat", "lon")] <- coordinates(dat.WGS84) 
+head(main.dat)
+```
+
+### 3.3 Calculate of prevalence by sub-district
+
+```{r}
+# calculate incidence of cases per 100000 population 
+main.dat <- main.dat %>% mutate(incidence = (cases / JUM_JANTIN) * 100000)
+```
+
+## 4 Describing spatial data
+
+### 4.1 Map the incidence
+
+```{r}
+main.data.sf.merge <- merge(Kel, main.dat, by.x="MUKIM", by.y="MUKIM") 
+tmap_mode("view")
+
+tm_shape(main.data.sf.merge) + tm_borders("grey25", alpha=.2) +
+  tm_shape(main.data.sf.merge) + 
+  tm_borders("grey25", alpha=.5)+ 
+  tm_fill("incidence", palette = "YlOrRd", style="cont", n=7,alpha=.6, fill.title = "", title = "Incidence of Leptospirosis Cases")
+```
+
+### 4.2 Map the incidence by Centroid of Sub-districts
+
+```{r}
+# create 4 color representing prevalence of cases
+pal <- colorBin("viridis", bins = c(0, 100, 200, 300, 400)) 
+
+#map the coordinate 
+leaflet(main.dat) %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addCircles(lng = ~lat, lat = ~lon, color = ~pal(incidence)) %>% 
+  addLegend("bottomright", pal = pal, values = ~ incidence, title = "Incidence", labFormat = labelFormat(digits = 5)) %>% 
+  addScaleBar(position = c("bottomleft"))
+```
+
+## 5 Import environmental covariate
+
+### 5.1 Get tPolygon Map to crop the 
+
+```{r}
+Malaysia <- st_read("mys_admbnda_adm1_unhcr_20210211.shp")
+```
+
+```{r}
+Kel.nomukim <- subset(Malaysia, ADM1_EN=='Kelantan')
+```
+
+```{r}
+Kel.WGS84 <- st_transform(Kel.nomukim, crs = 4326) # convert CRS from Kertau to WGS84 
+```
+
+```{r}
+Kel.WGS84
+```
+
+### 5.2 Altitude
+
+```{r}
+library(geodata)
+r <- elevation_30s(country = "MYS", path = tempdir())
+```
+
+### 5.3 Crop Altitude for Kelantan
+
+```{r}
+altitude.r.crop <- crop(r, Kel.WGS84)
+# remove raster value outside polygon 
+altitude.r.crop <- mask(r, Kel.WGS84)
+```
+
+### 5.4 Plot Altitude for Kelantan
+
+```{r}
+#plot the raster 
+tmap_mode("view")
+
+tm_shape(altitude.r.crop) +
+  tm_raster(style= "quantile", n = 7 , palette = viridis(7, direction = 1) ,alpha = .5,title = "Altitude (in meter)")
+```
+
+### 5.5 Add covariate (elevation) into main data sets
+
+```{r}
+main.dat$alt <- raster::extract(r, main.dat[, c("lat", "lon")])$MYS_elv_msk 
+head(main.dat)
+```
+
+## **6 Modeling**
+
+Here we specify the model to predict Leptospirosis in Kelantan and detail the steps to fit the model using the SPDE approach and the **R-INLA** package.
+
+### **6.1 Mesh construction**
+
+```{r}
+# extract the boundary of Kelantan from sf-class object to sp-class 
+kel.bdry <- as(Kel.WGS84, "Spatial") %>% INLA::inla.sp2segment()
+```
+
+```{r}
+# create the mesh and supply the boundary argument 
+coo <- cbind(main.dat$lat,main.dat$lon) 
+mesh <- INLA::inla.mesh.2d(boundary = kel.bdry,loc = coo, max.edge = c(0.1, 5), cutoff = 0.01)
+# No. of mesh created 
+mesh$n
+```
+
+```{r}
+plot(mesh) 
+points(coo, col = "red")
+```
+
+### 6.2 Build SPDE model on the mesh
+
+```{r}
+spde <- INLA::inla.spde2.matern(mesh = mesh, alpha = 2)
+```
+
+### 6.3 Index set
+
+Now we generate the index set for the SPDE model. We do this with the function `inla.spde.make.index()` where we specify the name of the effect (`s`) and the number of vertices in the SPDE model (`spde$n.spde`). This creates a list with vector `s` equal to `1:spde$n.spde`, and vectors `s.group` and `s.repl` that have all elements equal to 1s and size given by the number of mesh vertices.
+
+```{r}
+indexs <- INLA::inla.spde.make.index("s", spde$n.spde) 
+lengths(indexs)
+```
+
+### **6.4 Projection matrix**
+
+We need to build a projector matrix `A` that projects the spatially continuous Gaussian random field at the mesh nodes. The projector matrix `A` can be built with the `inla.spde.make.A()` function passing the mesh and the coordinates.
+
+```{r}
+A <- INLA::inla.spde.make.A(mesh = mesh, loc = coo)
+```
+
+### **6.5 Prediction data**
+
+Here we specify the locations where we wish to predict the prevalence. We set the prediction locations to the locations of the raster of the covariate elevation. We can get the coordinates of the raster `r` with the function [`crds()`](https://rspatial.github.io/terra/reference/crds.html) of the **terra** package.
+
+```{r}
+library(terra)
+```
+
+```{r}
+dp <- terra::crds(altitude.r.crop)
+dim(dp)
+```
+
+In this example, we use fewer prediction points so the computation is faster. We can lower the resolution of the raster by using the [`aggregate()`](https://rspatial.github.io/terra/reference/aggregate.html) function of **terra**. The arguments of the function are
+
+-   `x`: raster object,
+
+-   `fact`: aggregation factor expressed as number of cells in each direction (horizontally and vertically),
+
+-   `fun`: function used to aggregate values.
+
+We specify `fact = 5` to aggregate 5 cells in each direction, and `fun = mean` to compute the mean of the cell values.
+
+```{r}
+ra <- aggregate(altitude.r.crop, fact = 5, fun = mean)
+```
+
+```{r}
+dp <- terra::crds(ra)
+dp <- as.data.frame(dp)
+dim(dp)
+```
+
+We call `coop` to the matrix of coordinates with the prediction locations. We add to the prediction data `dp` a column `cov` with the elevation values for the prediction coordinates.
+
+```{r}
+coop <- terra::crds(ra)
+dp$cov <- extract(ra, coop)[, 1]
+```
+
+### **6.6 Projector matrix**
+
+We also construct the matrix that projects the spatially continuous Gaussian random field from the prediction locations to the mesh nodes.
+
+```{r}
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+```
+
+### 6.7 Stack data for the estimation and prediction
+
+```{r}
+# stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = main.dat$cases, numtrials = main.dat$JUM_JANTIN),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, elevation = main.dat$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, elevation = dp$cov),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+```
+
+### **6.8 Model formula**
+
+We specify the model formula by including the response in the left-hand side, and the fixed and random effects in the right-hand side. In the formula, we remove the intercept (adding `0`) and add it as a covariate term (adding `b0`), so all the covariate terms can be captured in the projection matrix.
+
+```{r}
+formula <- y ~ 0 + b0 + elevation + f(s, model = spde)
+```
+
+### **`6.9 inla()` call**
+
+We fit the model by calling [`inla()`](https://rdrr.io/pkg/INLA/man/inla.html) and using the default priors in **R-INLA**. We specify the formula, family, data, and options. In `control.predictor` we set `compute = TRUE` to compute the posteriors of the predictions. We set `link=1` to compute the fitted values (`res$summary.fitted.values` and `res$marginals.fitted.values`) with the same link function as the `family` specified in the model. We also add `control.compute = list(return.marginals.predictor = TRUE)` to obtain the marginals.
+
+```{r}
+res <- inla(formula,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(compute = TRUE, link = 1,
+                           A = inla.stack.A(stk.full)),
+  control.compute = list(return.marginals.predictor = TRUE)
+)
+```
+
+```{r}
+summary(res)
+```
+
+## 7 Mapping the ouput
+
+Now we map the Leptospirosis prevalence predictions using **leaflet**. The mean prevalence and lower and upper limits of 95% credible intervals are in the data frame `res$summary.fitted.values`. The rows of `res$summary.fitted.values` that correspond to the prediction locations can be obtained by selecting the indices of the stack `stk.full` that are tagged with `tag = "pred"`. We can obtain these indices by using [`inla.stack.index()`](https://rdrr.io/pkg/INLA/man/inla.stack.html) passing `stk.full` and `tag = "pred"`.
+
+```{r}
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+```
+
+We create vectors with the mean prevalence and lower and upper limits of 95% credible intervals with the values of the columns `"mean"`, `"0.025quant"` and `"0.975quant"` and the rows given by `index`.
+
+```{r}
+prev_mean <- res$summary.fitted.values[index, "mean"]
+prev_ll <- res$summary.fitted.values[index, "0.025quant"]
+prev_ul <- res$summary.fitted.values[index, "0.975quant"]
+```
+
+### 7.1 Mapping predicted mean incidence using raster
+
+```{r}
+# Create SpatVector object
+sv <- terra::vect(coop, atts = data.frame(prev_mean = prev_mean,
+                               prev_ll = prev_ll, prev_ul = prev_ul),
+                  crs = "+proj=longlat +datum=WGS84")
+
+# rasterize
+r_prev_mean <- terra::rasterize(
+  x = sv, y = ra, field = "prev_mean",
+  fun = mean
+)
+
+```
+
+```{r}
+pal <- colorNumeric("viridis", c(0, 1), na.color = "transparent")
+
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addRasterImage(r_prev_mean, colors = pal, opacity = 0.5) %>%
+  addLegend("bottomright",
+    pal = pal,
+    values = values(r_prev_mean), title = "Incidence"
+  ) %>%
+  addScaleBar(position = c("bottomleft"))
+```
+
+We can follow the same approach to create maps with the lower and upper limits of the prevalece estimates. First we create rasters with the lower and upper limits of the prevalences. Then we make the map with the same palette function we used to plot the mean prevalence.
